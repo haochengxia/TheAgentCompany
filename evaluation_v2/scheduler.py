@@ -109,6 +109,8 @@ def run_task(
     outputs_path: str,
     server_hostname: str,
     script_dir: str,
+    harness: str = "openhands",
+    base_image: str | None = None,
 ) -> dict:
     """Run a single task and return result info."""
     task_dir = str(TASKS_DIR / task_name)
@@ -124,7 +126,8 @@ def run_task(
                 "--env-llm-config", env_llm_config,
                 "--outputs-path", outputs_path,
                 "--server-hostname", server_hostname,
-            ],
+                "--harness", harness,
+            ] + (["--base-image", base_image] if base_image else []),
             capture_output=True,
             text=True,
             timeout=3600,  # 1 hour max per task
@@ -165,6 +168,8 @@ def run_group_sequential(
     outputs_path: str,
     server_hostname: str,
     script_dir: str,
+    harness: str = "openhands",
+    base_image: str | None = None,
 ) -> list[dict]:
     """Run all tasks in a group sequentially (they share services)."""
     svc = ", ".join(group_key) if group_key else "(no deps)"
@@ -181,7 +186,7 @@ def run_group_sequential(
                 continue
 
         print(f"  [{svc}] [{i}/{len(task_names)}] {task_name}: RUNNING...")
-        result = run_task(task_name, agent_llm_config, env_llm_config, outputs_path, server_hostname, script_dir)
+        result = run_task(task_name, agent_llm_config, env_llm_config, outputs_path, server_hostname, script_dir, harness, base_image)
         status = "OK" if result["success"] else "FAIL"
         print(f"  [{svc}] [{i}/{len(task_names)}] {task_name}: {status} ({result['duration']}s)")
         results.append(result)
@@ -198,6 +203,11 @@ def main():
     parser.add_argument("--tasks", type=str, default=None, help="Comma-separated task names to run")
     parser.add_argument("--list-groups", action="store_true", help="Print grouping plan and exit")
     parser.add_argument("--dry-run", action="store_true", help="Print execution plan without running")
+    parser.add_argument("--harness", type=str, default="openhands",
+                        choices=["openhands", "docker"],
+                        help="Harness to use (default: openhands)")
+    parser.add_argument("--base-image", type=str, default=None,
+                        help="Base Docker image (overrides TAC_BASE_IMAGE)")
     args = parser.parse_args()
 
     outputs_path = os.path.abspath(args.outputs_path)
@@ -259,6 +269,7 @@ def main():
                     args.agent_llm_config, args.env_llm_config,
                     outputs_path, args.server_hostname,
                     str(SCRIPT_DIR),
+                    args.harness, args.base_image,
                 )
                 round_futures[future] = gk
 
