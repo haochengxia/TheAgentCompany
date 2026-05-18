@@ -10,9 +10,8 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SERVERS_DIR="$(cd "$SCRIPT_DIR/../servers" && pwd)"
 SNAPSHOT_DIR="${SNAPSHOT_DIR:-$SCRIPT_DIR/snapshots}"
-SERVERS_DIR="$(cd "$SCRIPT_DIR/../../servers" && pwd)"
-
 mkdir -p "$SNAPSHOT_DIR"
 
 create_snapshot() {

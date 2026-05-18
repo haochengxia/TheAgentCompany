@@ -13,7 +13,6 @@ Usage (custom agent):
 
     class MyAgentHarness(DockerHarness):
         def run_agent(self, instruction, max_iterations=100, **kwargs):
-            # Your agent logic here
             self.run_command(f"echo '{instruction}' > /tmp/task.txt")
             return AgentState(success=True, trajectory_path="/tmp/traj.json")
 
@@ -43,6 +42,54 @@ from dataclasses import dataclass, field
 from typing import Callable, Optional
 
 logger = logging.getLogger(__name__)
+
+
+def build_anti_drift_message(
+    initial_instruction: str,
+    user_msg_count: int,
+    re_anchor_every: int = 5,
+) -> str | None:
+    if user_msg_count % re_anchor_every != 0:
+        return None
+    return (
+        f"ANCHOR CHECK (prompt #{user_msg_count}): "
+        f"Restate the final deliverable from the original task:\n---\n{initial_instruction}\n"
+        f"---\n"
+        "Do you have explicit evidence that the deliverable is complete? "
+        "Check the world-state (file system, remote UI) before saying done. "
+        "If not complete, continue working."
+    )
+
+
+def build_enhanced_user_response(
+    initial_instruction: str,
+    default_fn: Optional[Callable] = None,
+    re_anchor_every: int = 5,
+) -> Callable:
+    def enhanced_response(state) -> str:
+        from openhands.events.action import MessageAction
+
+        user_msgs = [
+            e for e in state.history
+            if isinstance(e, MessageAction) and e.source == "user"
+        ]
+        count = len(user_msgs)
+
+        if default_fn is not None:
+            base_msg = default_fn(state)
+        else:
+            base_msg = (
+                "Please continue working on the task. "
+                "If you have finished, the task is done — no need to ask for help."
+            )
+
+        anchor = build_anti_drift_message(initial_instruction, count, re_anchor_every)
+        if anchor is not None:
+            return anchor
+
+        return base_msg
+
+    return enhanced_response
 
 
 @dataclass
@@ -95,7 +142,8 @@ class BaseHarness(ABC):
 
     @abstractmethod
     def run_agent(self, instruction: str, max_iterations: int = 100,
-                  fake_user_response: Optional[Callable] = None) -> AgentState:
+                  fake_user_response: Optional[Callable] = None,
+                  dependencies: Optional[list[str]] = None) -> AgentState:
         ...
 
     @abstractmethod
@@ -135,30 +183,9 @@ class BaseHarness(ABC):
         }
 
         for src_name, dst in routes.items():
-            src_name_clean = src_name.rstrip("/")
-            if src_name_clean in handled:
+            if src_name in handled:
                 continue
-            if dst in ("/npc",):
-                commands.append(f"cp /outputs/task_staging/'{src_name_clean}' /npc/'{src_name_clean}'")
-            elif dst in ("/data", "/data/"):
-                commands.append(f"cp /outputs/task_staging/'{src_name_clean}' /data/'{src_name_clean}'")
-            elif dst in ("/utils", "/utils/"):
-                commands.append(f"cp /outputs/task_staging/'{src_name_clean}' /utils/'{src_name_clean}'")
-            elif dst.startswith("/workspace"):
-                commands.append(f"cp /outputs/task_staging/'{src_name_clean}' {dst}")
-            handled.add(src_name_clean)
-
-        if os.path.isdir(os.path.join(abs_task_dir, "eval_data")):
-            commands.append(
-                "if [ -d /outputs/task_staging/eval_data ]; then "
-                "cp -r /outputs/task_staging/eval_data/* /utils/ 2>/dev/null || true; fi"
-            )
-
-        if os.path.isdir(os.path.join(abs_task_dir, "app")) and "app/" not in routes:
-            commands.append(
-                "if [ -d /outputs/task_staging/app ]; then "
-                "cp -r /outputs/task_staging/app /workspace/app; fi"
-            )
+            commands.append(f"cp -r /outputs/task_staging/{src_name} {dst}/{src_name}")
 
         if "scenarios.json" not in routes and os.path.exists(os.path.join(abs_task_dir, "scenarios.json")):
             commands.append("cp /outputs/task_staging/scenarios.json /npc/scenarios.json")
@@ -213,7 +240,8 @@ class DockerHarness(BaseHarness):
         )
 
     def run_agent(self, instruction: str, max_iterations: int = 100,
-                  fake_user_response: Optional[Callable] = None) -> AgentState:
+                  fake_user_response: Optional[Callable] = None,
+                  dependencies: Optional[list[str]] = None) -> AgentState:
         raise NotImplementedError(
             "DockerHarness.run_agent() is a no-op by default. "
             "Subclass DockerHarness and override run_agent() with your agent logic."
@@ -285,7 +313,8 @@ class OpenHandsHarness(BaseHarness):
         return CommandResult(exit_code=obs.exit_code, content=obs.content)
 
     def run_agent(self, instruction: str, max_iterations: int = 100,
-                  fake_user_response: Optional[Callable] = None) -> AgentState:
+                  fake_user_response: Optional[Callable] = None,
+                  dependencies: Optional[list[str]] = None) -> AgentState:
         from openhands.controller.state.state import State
         from openhands.core.main import run_controller
         from openhands.events.action import MessageAction
@@ -305,13 +334,21 @@ class OpenHandsHarness(BaseHarness):
                     return msg + "If you want to give up, run: <execute_bash> exit </execute_bash>.\n"
             return msg
 
+        if fake_user_response is not None:
+            enhanced_fn = fake_user_response
+        else:
+            enhanced_fn = build_enhanced_user_response(
+                instruction,
+                default_fn=default_user_response,
+            )
+
         state: State | None = asyncio.run(
             run_controller(
                 config=self._config,
                 sid="eval",
                 initial_user_action=MessageAction(content=instruction),
                 runtime=self._runtime,
-                fake_user_response_fn=fake_user_response or default_user_response,
+                fake_user_response_fn=enhanced_fn,
             )
         )
 
@@ -322,4 +359,4 @@ class OpenHandsHarness(BaseHarness):
         )
 
     def copy_to_container(self, src: str, dst: str):
-        raise NotImplementedError("OpenHandsHarness uses run_command for file operations")
+        raise NotImplementedError("OpenHandsHarness does not support copy_to_container")

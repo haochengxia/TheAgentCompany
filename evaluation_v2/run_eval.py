@@ -1,5 +1,6 @@
 import os
 import shutil
+import subprocess
 import sys
 import json
 import yaml
@@ -7,29 +8,60 @@ import tempfile
 import base64
 import logging
 
-from harness import BaseHarness, OpenHandsHarness, DockerHarness, parse_dockerfile_copies
+from harness import BaseHarness, OpenHandsHarness, DockerHarness
 
 logger = logging.getLogger(__name__)
 
 BASE_IMAGE = os.environ.get("TAC_BASE_IMAGE", "tac-base-image:latest")
 
 
-def load_dependencies(harness: BaseHarness) -> list[str]:
+def load_dependencies(harness: BaseHarness, task_dir: str | None = None) -> list[str]:
+    if task_dir:
+        dep_path = os.path.join(task_dir, "dependencies.yml")
+        if os.path.exists(dep_path):
+            with open(dep_path) as f:
+                dependencies = yaml.safe_load(f)
+            if dependencies is None:
+                dependencies = []
+            return dependencies
+
     result = harness.run_command("cat /utils/dependencies.yml")
     assert result.exit_code == 0, f"Failed to load dependencies: {result.content}"
-    dependencies = yaml.safe_load(result.content)
-    if dependencies is None:
-        dependencies = []
+    raw = result.content
+    lines = [l for l in raw.splitlines() if not l.lstrip().startswith("#")]
+    dependencies = yaml.safe_load("\n".join(lines)) or []
     return dependencies
 
 
 def init_task_env(harness: BaseHarness, hostname: str, llm_api_key: str | None,
-                  llm_base_url: str | None, llm_model: str | None):
-    command = (
+                  llm_base_url: str | None, llm_model: str | None,
+                  port_overrides: dict | None = None):
+    """Initialize task environment inside the container.
+
+    Args:
+        harness: The harness to run commands through.
+        hostname: Server hostname for SERVICE_HOSTNAME.
+        llm_api_key: LITELLM API key.
+        llm_base_url: LITELLM base URL.
+        llm_model: LITELLM model name.
+        port_overrides: Optional dict of service -> port mappings for multi-instance.
+    """
+    env_vars = (
         f"SERVER_HOSTNAME={hostname} "
         f"LITELLM_API_KEY={llm_api_key} "
         f"LITELLM_BASE_URL={llm_base_url} "
         f"LITELLM_MODEL={llm_model} "
+    )
+
+    if port_overrides:
+        env_vars += f"GITLAB_PORT={port_overrides.get('gitlab', 8929)} "
+        env_vars += f"API_PORT={port_overrides.get('api_server', 2999)} "
+        env_vars += f"ROCKETCHAT_PORT={port_overrides.get('rocketchat', 3000)} "
+        env_vars += f"OWNCLOUD_PORT={port_overrides.get('owncloud', 8092)} "
+        env_vars += f"PLANE_PORT={port_overrides.get('plane', 8091)} "
+
+    command = (
+        env_vars +
         "echo '' | sudo tee -a /etc/hosts && "
         "bash /utils/init.sh"
     )
@@ -44,7 +76,8 @@ def run_solver(harness: BaseHarness, task_name: str, dependencies: list[str],
     if "gitlab" in dependencies:
         instruction += "\n\nGitlab username is 'root' and password is 'theagentcompany'"
 
-    state = harness.run_agent(instruction=instruction, max_iterations=100)
+    state = harness.run_agent(instruction=instruction, max_iterations=100,
+                              dependencies=dependencies)
 
     if save_screenshots and state.screenshots:
         task_screenshots_dir = os.path.join(screenshots_dir, task_name)
@@ -76,6 +109,18 @@ def run_evaluator(harness: BaseHarness, llm_api_key: str | None,
     assert result.exit_code == 0, f"Evaluator failed: {result.content}"
 
 
+def _build_port_overrides(service_instance: dict | None) -> dict | None:
+    if service_instance is None:
+        return None
+    return {
+        "gitlab": service_instance.get("gitlab_port", 8929),
+        "api_server": service_instance.get("api_port", 2999),
+        "rocketchat": service_instance.get("rocketchat_port", 3000),
+        "owncloud": service_instance.get("owncloud_port", 8092),
+        "plane": service_instance.get("plane_port", 8091),
+    }
+
+
 if __name__ == "__main__":
     import argparse
 
@@ -99,7 +144,16 @@ if __name__ == "__main__":
                         help="LLM config for evaluation environment (NPC & evaluator)")
     parser.add_argument("--build-image-only", action="store_true",
                         help="Build runtime image and exit (openhands harness only)")
+    parser.add_argument("--service-instance", type=str, default=None,
+                        help="JSON string with service instance info (multi-instance mode)")
     args = parser.parse_args()
+
+    service_instance = None
+    if args.service_instance:
+        service_instance = json.loads(args.service_instance)
+        logger.info(f"Multi-instance mode: instance {service_instance.get('instance_id', 0)}")
+
+    port_overrides = _build_port_overrides(service_instance)
 
     if args.task_dir:
         task_dir = os.path.abspath(args.task_dir)
@@ -168,13 +222,17 @@ if __name__ == "__main__":
     if task_dir:
         staging_dir = os.path.join(mount_path, "task_staging")
         if os.path.exists(staging_dir):
-            shutil.rmtree(staging_dir)
+            try:
+                shutil.rmtree(staging_dir)
+            except PermissionError:
+                subprocess.run(["sudo", "rm", "-rf", staging_dir], check=True)
         shutil.copytree(task_dir, staging_dir)
 
         harness.setup_task_files(task_dir)
 
-    init_task_env(harness, args.server_hostname, env_api_key, env_base_url, env_model)
-    dependencies = load_dependencies(harness)
+    init_task_env(harness, args.server_hostname, env_api_key, env_base_url, env_model,
+                  port_overrides=port_overrides)
+    dependencies = load_dependencies(harness, task_dir=task_dir)
     logger.info(f"Service dependencies: {dependencies}")
 
     outputs_path = os.path.abspath(args.outputs_path)
@@ -187,7 +245,8 @@ if __name__ == "__main__":
                       screenshots_dir=os.path.join(outputs_path, "screenshots"))
         except Exception as e:
             logger.error(f"Failed to pre-login: {e}")
-            init_task_env(harness, args.server_hostname, env_api_key, env_base_url, env_model)
+            init_task_env(harness, args.server_hostname, env_api_key, env_base_url, env_model,
+                          port_overrides=port_overrides)
             pre_login(harness._runtime, dependencies, save_screenshots=True,
                       screenshots_dir=os.path.join(outputs_path, "screenshots"))
 
