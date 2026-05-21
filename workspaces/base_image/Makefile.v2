@@ -1,0 +1,23 @@
+IMAGE_NAME=tac-base-image
+IMAGE_TAG=latest
+GHCR=ghcr.io/theagentcompany
+GHCR_NAME=tac-base-image
+
+.PHONY: build run stop attach push
+
+build:
+	docker build -t $(IMAGE_NAME):$(IMAGE_TAG) -f Dockerfile.v2 .
+
+run:
+	docker run -d --name $(IMAGE_NAME) $(IMAGE_NAME):$(IMAGE_TAG)
+
+stop:
+	docker stop $(IMAGE_NAME) || true
+	docker rm $(IMAGE_NAME) || true
+
+attach:
+	docker exec -it $(IMAGE_NAME) /bin/bash
+
+push:
+	docker tag $(IMAGE_NAME):$(IMAGE_TAG) $(GHCR)/$(GHCR_NAME):$(IMAGE_TAG)
+	docker push $(GHCR)/$(GHCR_NAME):$(IMAGE_TAG)

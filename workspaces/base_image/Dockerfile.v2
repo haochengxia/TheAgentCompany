@@ -1,0 +1,103 @@
+# TheAgentCompany - Consolidated Base Image
+# Replaces 175 per-task images with ONE image + runtime mount
+#
+# Key changes from v1:
+# - All commonly-needed pip/apt packages pre-installed (no per-task Dockerfiles)
+# - No ONBUILD directives (task files mounted at runtime instead)
+# - Encrypt happens at init time, not build time
+# - Single OpenHands runtime image built once and reused
+
+FROM python:3.12
+
+################## APT PACKAGES ################################
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    iputils-ping \
+    vim \
+    sqlite3 \
+    cmake \
+    poppler-utils \
+    zip \
+    curl \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+################## PIP PACKAGES ################################
+# Commonly used across tasks (pre-installed to avoid per-task installs)
+RUN pip install --no-cache-dir \
+    requests==2.32.3 \
+    cryptography==44.0.0 \
+    pandas==2.2.3 \
+    openpyxl==3.1.5 \
+    python-pptx==1.0.2 \
+    python-docx==1.1.2 \
+    odfpy==1.4.1 \
+    poetry \
+    numpy==2.1.2 \
+    PyPDF2==3.0.1 \
+    Pillow==11.0.0 \
+    pymupdf==1.24.13 \
+    gremlinpython==3.7.3 \
+    scikit-learn==1.5.2 \
+    matplotlib==3.9.2 \
+    seaborn==0.11.1 \
+    pdf2image \
+    astor \
+    beautifulsoup4 \
+    mypy \
+    coverage \
+    torch --index-url https://download.pytorch.org/whl/cpu \
+    && rm -rf /root/.cache/pip
+
+################## NPC SETUP ################################
+RUN pip install --no-cache-dir \
+    rocketchat_API==1.32.0 \
+    sotopia==0.1.2 \
+    hiredis==3.0.0 \
+    litellm==1.23.16 \
+    && rm -rf /root/.cache/pip
+
+################## DIRECTORY LAYOUT ###########################
+# /task - mounted at runtime with task-specific files
+#   task.md          -> symlinked to /instruction/task.md
+#   evaluator.py     -> copied to /utils/evaluator.py (encrypted)
+#   dependencies.yml -> copied to /utils/dependencies.yml
+#   scenarios.json   -> copied to /npc/scenarios.json (if exists)
+#   *.py             -> copied to /utils/ (pre_init, post_init, populate_data, etc.)
+#   eval_data/       -> copied to /utils/eval_data/ (if exists)
+#   data files       -> copied to /workspace/ or /utils/ per task config
+# /utils  - internal utilities (not accessible to agent)
+# /instruction - task instructions for agent
+# /workspace - agent's working directory
+# /npc - NPC support files
+
+RUN mkdir -p /utils /instruction /workspace /npc /task /data
+WORKDIR /workspace
+
+# Softlink for python alias safety
+RUN ln -s /usr/local/bin/python3 /usr/local/bin/python_default
+
+# Copy utility scripts
+COPY init.sh /utils/init.sh
+COPY reset_v2.sh /utils/reset.sh
+COPY mount_task.sh /utils/mount_task.sh
+COPY common.py /utils/common.py
+COPY config.py /utils/config.py
+COPY scoring.py /utils/scoring.py
+COPY eval.py /utils/eval.py
+COPY encrypt.py /utils/encrypt.py
+RUN chmod +x /utils/init.sh /utils/reset.sh /utils/mount_task.sh
+
+# Copy NPC files
+COPY ./npc /npc
+
+# Environment
+ENV CREDENTIAL_FILE_PATH=/npc/npc_credential.json
+ENV SCENARIOS_FILE_PATH=/npc/scenarios.json
+ENV REDIS_OM_URL="redis://default:theagentcompany@the-agent-company.com/:6379"
+ENV BOT_URL="http://the-agent-company.com:3000"
+ENV PYTHONPATH="/utils:$PYTHONPATH"
+
+# mount_task.sh is the entrypoint for the v2 system
+# It copies task files from /task mount into the right locations and encrypts evaluator
+ENTRYPOINT ["/bin/bash", "/utils/mount_task.sh"]
+CMD ["/bin/bash"]

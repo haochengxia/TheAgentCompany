@@ -177,3 +177,8 @@ cython_debug/
 matterbridge/*
 redis*
 !matterbridge/matterbridge.toml
+
+# evaluation_v2: instance dirs (auto-generated at deploy time)
+evaluation_v2/.instance_*/
+evaluation_v2/snapshots/
+evaluation_v2/config*.toml
