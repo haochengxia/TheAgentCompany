@@ -346,67 +346,57 @@ def _split_groups_across_instances(
     groups: dict[tuple[str, ...], list[str]],
     instance_manager_ref: dict,
 ) -> dict[tuple[tuple[str, ...], int | None], tuple[list[str], dict | None]]:
-    """Assign groups to instances for maximum parallelism.
+    """Assign groups to instances with load balancing.
 
-    Strategy:
-      - Gitlab-only groups: split across instances 1+ (non-zero)
-      - Mixed-service groups: assigned to instance 0 (full stack)
-      - Multiple groups on instance 0 run in parallel within their
-        subprocess — they use different services so no conflicts.
-      - No pre-locking: instance assignment is advisory; each group
-        gets connection info for its target instance.
-
-    Returns:
-        dict mapping (group_key, instance_id) -> (task_batch, instance_info)
+    Tracks total task count per instance per round and assigns
+    each group to the lightest-loaded matching instance.
+    Gitlab-only groups prefer non-zero instances.
     """
     result = {}
     mgr = instance_manager_ref.get("manager")
+    load: dict[int, int] = {}
 
     for gk in round_groups:
         task_names = groups[gk]
         svc_label = "+".join(gk) if gk else "no-deps"
         services_needed = list(gk) if gk else []
 
-        # Single-instance mode: no splitting needed
         if mgr is None:
             result[(gk, None)] = (task_names, None)
             continue
 
         is_gitlab_only = services_needed == ["gitlab"]
 
-        # Find instances that have the required services
         matching = [
-            (iid, len(inst.services))
-            for iid, inst in mgr.instances.items()
-            if all(svc in inst.services for svc in services_needed)
+            iid for iid in mgr.instances
+            if all(svc in mgr.instances[iid].services for svc in services_needed)
         ]
 
         if is_gitlab_only:
-            # Prefer non-zero instances to leave instance 0 for mixed groups
-            non_zero = sorted([m for m in matching if m[0] != 0], key=lambda x: x[1])
-            targets = non_zero if non_zero else sorted(matching, key=lambda x: x[1])
+            non_zero = sorted([i for i in matching if i != 0], key=lambda i: load.get(i, 0))
+            targets = non_zero if non_zero else sorted(matching, key=lambda i: load.get(i, 0))
         else:
-            targets = sorted(matching, key=lambda x: x[1])
+            targets = sorted(matching, key=lambda i: load.get(i, 0))
 
         if not targets:
-            print(f"    [{svc_label}] no matching instance, fallback to instance 0")
-            result[(gk, 0)] = (task_names, mgr.get_connection_info(0))
-            continue
+            targets = [0]
 
-        if len(targets) == 1 or len(task_names) <= 1:
-            inst_id = targets[0][0]
-            inst_info = mgr.get_connection_info(inst_id)
-            result[(gk, inst_id)] = (task_names, inst_info)
-            print(f"    [{svc_label}] {len(task_names)} tasks -> instance {inst_id}")
+        if len(targets) <= 1 or len(task_names) <= 1:
+            tid = targets[0]
+            load[tid] = load.get(tid, 0) + len(task_names)
+            inst_info = mgr.get_connection_info(tid)
+            result[(gk, tid)] = (task_names, inst_info)
+            print(f"  [{svc_label}] {len(task_names)} tasks -> instance {tid}")
         else:
-            print(f"    [{svc_label}] splitting {len(task_names)} tasks across {len(targets)} instances: {[a[0] for a in targets]}")
-            for idx, (inst_id, _) in enumerate(targets):
+            targets.sort(key=lambda i: load.get(i, 0))
+            for idx, tid in enumerate(targets):
                 chunk = task_names[idx::len(targets)]
                 if not chunk:
                     continue
-                inst_info = mgr.get_connection_info(inst_id)
-                result[(gk, inst_id)] = (chunk, inst_info)
-                print(f"    [{svc_label}] chunk {idx}: {len(chunk)} tasks -> instance {inst_id}")
+                load[tid] = load.get(tid, 0) + len(chunk)
+                inst_info = mgr.get_connection_info(tid)
+                result[(gk, tid)] = (chunk, inst_info)
+                print(f"  [{svc_label}] chunk {idx}: {len(chunk)} tasks -> instance {tid}")
 
     return result
 def _pick_instance_for_group(
@@ -532,7 +522,8 @@ def main():
         sub_groups = _split_groups_across_instances(
             round_groups, groups, instance_manager_ref,
         )
-        max_workers = min(sum(len(batch) for batch, _ in sub_groups.values()), args.max_groups)
+        unique_insts = len({inst_id for _, inst_id in sub_groups.keys()})
+        max_workers = min(unique_insts, len(sub_groups), 16)
         with ProcessPoolExecutor(max_workers=max_workers) as executor:
             for (gk, inst_id), (task_batch, inst_info) in sub_groups.items():
                 svc = ", ".join(gk) if gk else "(no deps)"
